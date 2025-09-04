@@ -1,0 +1,18 @@
+# 医学图像AI诊断系统依赖包
+streamlit>=1.28.0
+torch>=2.0.0
+transformers>=4.35.0
+modelscope>=1.9.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# ModelScope pipeline 依赖
+addict>=2.4.0
+datasets>=4.0.0
+
+# 系统信息获取
+psutil>=5.9.0
+
+# 可选的增强组件
+streamlit-option-menu>=0.3.6
+streamlit-elements>=0.1.0
