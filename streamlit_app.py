@@ -42,6 +42,7 @@ def _ensure_session_state(available_models: Dict[str, Dict[str, str]]) -> None:
         "device": None,
         "model_type": "glm4v",
         "analysis_results": [],
+        "loading_model": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -222,6 +223,7 @@ def _load_selected_model(selected_model: str, model_config: Dict[str, str]) -> N
     st.session_state.model_type = model_type
     st.session_state.model_loaded = True
     st.session_state.loading_model = False
+    st.session_state.pop("loading_target", None)
     st.success(f"✅ {selected_model} 模型加载成功！")
     st.rerun()
 
@@ -234,6 +236,16 @@ def _render_device_info_section() -> None:
 def _render_sidebar() -> None:
     """渲染侧边栏配置。"""
     available_models = st.session_state.available_models
+
+    def _format_model_option(name: str) -> str:
+        info = available_models[name]
+        if info.get("source") == "local":
+            identifier = info.get("identifier", name)
+            if "/" in identifier:
+                owner, model = identifier.split("/", 1)
+                return f"{owner} / {model}"
+            return identifier
+        return info.get("description", name)
 
     with st.sidebar:
         st.header("🔧 系统配置")
@@ -260,16 +272,25 @@ def _render_sidebar() -> None:
             "选择模型",
             options=model_names,
             index=default_index,
-            format_func=lambda x: available_models[x].get("description", x),
+            format_func=_format_model_option,
         )
 
         model_info = available_models[selected_model]
+        st.caption(f"模型位置：{model_info.get('path')}")
+
         model_needs_reload = (
             not st.session_state.model_loaded
             or st.session_state.current_model != selected_model
         )
 
         is_loading = st.session_state.get("loading_model", False)
+        loading_target = st.session_state.get("loading_target")
+
+        if is_loading and loading_target and loading_target != selected_model:
+            st.session_state.loading_model = False
+            st.session_state.pop("loading_target", None)
+            st.info("已切换模型，取消先前的加载任务")
+            is_loading = False
 
         button_label = "⏳ 正在加载...点击取消" if is_loading else (
             "🚀 加载模型" if model_needs_reload else "🔄 重新加载模型"
@@ -285,13 +306,16 @@ def _render_sidebar() -> None:
         if button_clicked:
             if is_loading:
                 st.session_state.loading_model = False
+                st.session_state.pop("loading_target", None)
                 st.info("已取消模型加载")
             else:
                 st.session_state.loading_model = True
+                st.session_state.loading_target = selected_model
                 try:
                     _load_selected_model(selected_model, model_info)
                 except Exception as exc:
                     st.session_state.loading_model = False
+                    st.session_state.pop("loading_target", None)
                     st.error(f"❌ 模型加载失败：{exc}")
 
         if st.session_state.model_loaded and (

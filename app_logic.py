@@ -7,13 +7,18 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 import torch
 from PIL import Image
-from modelscope import AutoProcessor, Glm4vForConditionalGeneration
+from modelscope import (
+    AutoProcessor,
+    Glm4vForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
+)
 from transformers import AutoModelForCausalLM, TextIteratorStreamer
 from transformers import AutoProcessor as MedGemmaProcessor
 
@@ -48,7 +53,14 @@ REMOTE_MODEL_TEMPLATES: Dict[str, Dict[str, str]] = {
         "description": "MedGemma医学专用模型 (4B参数)",
         "model_type": "medgemma",
     },
+    "Qwen3-VL-8B": {
+        "identifier": "Qwen/Qwen3-VL-8B-Instruct",
+        "description": "Qwen3 VL 8B 视觉语言模型",
+        "model_type": "qwen3_vl",
+    },
 }
+
+SUPPORTED_MODEL_TYPES = {"glm4v", "medgemma", "qwen3_vl"}
 
 
 @dataclass(slots=True)
@@ -65,10 +77,26 @@ def _resolve_local_model_path(identifier: str) -> Optional[str]:
     """尝试根据模型标识符定位本地缓存目录。"""
     normalized = identifier.replace("\\", "/").split("/")
     for base in DEFAULT_MODEL_BASES:
-        candidate = os.path.join(base, *normalized)
-        if os.path.isdir(candidate):
-            return candidate
+        candidate_path = Path(os.path.join(base, *normalized))
+        if candidate_path.is_dir() and _contains_files(candidate_path):
+            return str(candidate_path)
     return None
+
+
+def _contains_files(directory: Path) -> bool:
+    """判断目录下是否存在至少一个文件（递归遍历）。"""
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        try:
+            for entry in current.iterdir():
+                if entry.is_file():
+                    return True
+                if entry.is_dir():
+                    stack.append(entry)
+        except (PermissionError, OSError):
+            continue
+    return False
 
 
 def _discover_local_catalog(base_path: str) -> "OrderedDict[str, Dict[str, str]]":
@@ -89,23 +117,42 @@ def _discover_local_catalog(base_path: str) -> "OrderedDict[str, Dict[str, str]]
     for owner in owners:
         try:
             models = sorted(
-                [entry for entry in owner.iterdir() if entry.is_dir()],
+                [
+                    entry
+                    for entry in owner.iterdir()
+                    if entry.is_dir() and _contains_files(entry)
+                ],
                 key=lambda p: p.name.lower(),
             )
         except PermissionError:
             continue
 
         for model_dir in models:
-            key = f"本地:{owner.name}/{model_dir.name}"
-            if key in results:
-                continue
+            config_path = model_dir / "config.json"
+            model_type = "glm4v"
+            description = f"{owner.name}/{model_dir.name}"
+
+            if config_path.is_file():
+                try:
+                    with config_path.open("r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    model_type = cfg.get("model_type", model_type)
+                    if cfg.get("model_name"):
+                        description = cfg["model_name"]
+                except (json.JSONDecodeError, OSError):
+                    pass
 
             lower_name = model_dir.name.lower()
-            model_type = "medgemma" if "medgemma" in lower_name else "glm4v"
+            if "qwen" in lower_name or "qwen" in owner.name.lower():
+                model_type = "qwen3_vl"
+
+            key = f"{owner.name}/{model_dir.name}"
+            if key in results or model_type not in SUPPORTED_MODEL_TYPES:
+                continue
 
             results[key] = {
-                "identifier": f"{owner.name}/{model_dir.name}",
-                "description": f"本地缓存模型 {owner.name}/{model_dir.name}",
+                "identifier": key,
+                "description": description,
                 "model_type": model_type,
                 "path": str(model_dir),
                 "location": str(model_dir),
@@ -133,11 +180,12 @@ def build_available_models() -> Dict[str, Dict[str, str]]:
             config["source"] = "remote"
             config["location"] = identifier
 
-        models[name] = config
+        if config.get("model_type") in SUPPORTED_MODEL_TYPES:
+            models[name] = config
 
     for base_path in DEFAULT_MODEL_BASES:
         for name, config in _discover_local_catalog(base_path).items():
-            if name not in models:
+            if name not in models and config.get("model_type") in SUPPORTED_MODEL_TYPES:
                 models[name] = config
 
     return models
@@ -397,10 +445,12 @@ def load_model(model_name: str, model_config: Dict[str, str]):
     model_path = model_config["path"]
     model_type = model_config.get("model_type", "glm4v")
 
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
     if model_type == "glm4v":
         model = Glm4vForConditionalGeneration.from_pretrained(
             pretrained_model_name_or_path=model_path,
-            torch_dtype=torch.bfloat16,
+            dtype=dtype,
             device_map="cuda:0" if torch.cuda.is_available() else "cpu",
         )
         processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
@@ -413,7 +463,7 @@ def load_model(model_name: str, model_config: Dict[str, str]):
 
         model = AutoModelForCausalLM.from_pretrained(
             model_load_path,
-            torch_dtype=torch.bfloat16,
+            dtype=dtype,
             device_map="cuda:0" if torch.cuda.is_available() else "cpu",
             trust_remote_code=True,
         )
@@ -421,6 +471,19 @@ def load_model(model_name: str, model_config: Dict[str, str]):
             model_load_path, trust_remote_code=True
         )
         return model, processor, device, "medgemma"
+
+    if model_type == "qwen3_vl":
+        model_load_path = model_path
+        if not os.path.exists(model_load_path):
+            model_load_path = model_config.get("identifier", model_path)
+
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            model_load_path,
+            dtype="auto",
+            device_map="auto",
+        )
+        processor = AutoProcessor.from_pretrained(model_load_path)
+        return model, processor, device, "qwen3_vl"
 
     raise ValueError(f"暂不支持的模型类型：{model_type}")
 
@@ -520,7 +583,10 @@ def process_image_analysis(
         add_generation_prompt=True,
         return_dict=True,
         return_tensors="pt",
-    ).to(device)
+    )
+
+    if not hasattr(model, "hf_device_map"):
+        inputs = inputs.to(device)
 
     start_time = time.time()
 
@@ -540,6 +606,16 @@ def process_image_analysis(
             processor,
             inputs,
             max_new_tokens=4096,
+            temperature=0.7,
+            top_p=0.9,
+            stream_callback=stream_callback,
+        )
+    elif model_type == "qwen3_vl":
+        raw_text = _stream_model_output(
+            model,
+            processor,
+            inputs,
+            max_new_tokens=1024,
             temperature=0.7,
             top_p=0.9,
             stream_callback=stream_callback,
