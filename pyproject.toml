@@ -13,7 +13,8 @@ dependencies = [
     "psutil>=5.9.0",
     "pandas>=2.1.0",
     "accelerate>=0.29.0",
-    "torchvision>=0.24.0",
+    "vllm>=0.5.0",
+    "qwen-vl-utils>=0.0.14",
 ]
 
 [[tool.uv.index]]

@@ -1,25 +1,22 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import os
 import sqlite3
-import threading
 import time
 from collections import OrderedDict
 import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from PIL import Image
-from modelscope import (
-    AutoProcessor,
-    Glm4vForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
-)
-from transformers import AutoModelForCausalLM, TextIteratorStreamer
+from modelscope import AutoProcessor
+from qwen_vl_utils import process_vision_info
+from vllm import LLM, SamplingParams
 from transformers import AutoProcessor as MedGemmaProcessor
 
 SUPPORTED_FORMATS = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"]
@@ -31,6 +28,10 @@ DEFAULT_MODEL_BASES = [
     DEFAULT_MODEL_BASE,
     os.path.expanduser("~/.cache/modelscope/hub/models"),
 ]
+
+_LOADED_MODELS: Dict[str, Dict[str, Any]] = {}
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 DEFAULT_MEDICAL_PROMPT = """
 你是资深影像科医生。结合所给医学图像，请直接输出以下三部分内容，保持语言精炼、专业、中文：
@@ -61,6 +62,104 @@ REMOTE_MODEL_TEMPLATES: Dict[str, Dict[str, str]] = {
 }
 
 SUPPORTED_MODEL_TYPES = {"glm4v", "medgemma", "qwen3_vl"}
+
+
+def _encode_image_to_base64(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{base64_str}"
+
+
+def _resolve_vllm_gpu_utilization(config: Dict[str, Any]) -> float:
+    env_value = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION")
+    config_value = config.get("gpu_memory_utilization", 0.7)
+    try:
+        return float(env_value if env_value is not None else config_value)
+    except (TypeError, ValueError):
+        return 0.7
+
+
+def _resolve_vllm_max_model_len(config: Dict[str, Any]) -> int:
+    env_value = os.environ.get("VLLM_MAX_MODEL_LEN")
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            pass
+
+    config_value = config.get("max_model_len")
+    if config_value is not None:
+        try:
+            return int(config_value)
+        except (TypeError, ValueError):
+            pass
+
+    return 32768
+
+
+def _resolve_sampling_params(model_type: str, config: Dict[str, Any]) -> SamplingParams:
+    default_max_tokens = {
+        "glm4v": 2048,
+        "medgemma": 1024,
+        "qwen3_vl": 1024,
+    }.get(model_type, 1024)
+
+    max_tokens = config.get("max_tokens", default_max_tokens)
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        max_tokens = default_max_tokens
+
+    temperature = config.get("temperature", 0.7 if model_type != "glm4v" else 0.8)
+    top_p = config.get("top_p", 0.9)
+
+    try:
+        temperature = float(temperature)
+    except (TypeError, ValueError):
+        temperature = 0.7 if model_type != "glm4v" else 0.8
+
+    try:
+        top_p = float(top_p)
+    except (TypeError, ValueError):
+        top_p = 0.9
+
+    return SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        stop_token_ids=[],
+    )
+
+
+def _prepare_inputs_for_vllm(messages: List[Dict[str, object]], processor) -> Dict[str, object]:
+    prompt = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    image_patch_size = getattr(
+        getattr(processor, "image_processor", None), "patch_size", None
+    )
+    image_inputs, video_inputs, video_kwargs = process_vision_info(
+        messages,
+        image_patch_size=image_patch_size,
+        return_video_kwargs=True,
+        return_video_metadata=True,
+    )
+
+    multimodal_data: Dict[str, object] = {}
+    if image_inputs is not None:
+        multimodal_data["image"] = image_inputs
+    if video_inputs is not None:
+        multimodal_data["video"] = video_inputs
+
+    return {
+        "prompt": prompt,
+        "multi_modal_data": multimodal_data,
+        "mm_processor_kwargs": video_kwargs,
+    }
 
 
 @dataclass(slots=True)
@@ -440,52 +539,76 @@ def clear_analysis_cache() -> None:
 
 
 def load_model(model_name: str, model_config: Dict[str, str]):
-    """加载指定模型，返回 (model, processor, device, model_type)。"""
+    """加载指定模型，返回 (model_bundle, processor, device, model_type)。"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_path = model_config["path"]
     model_type = model_config.get("model_type", "glm4v")
+    location = model_config.get("path") or model_config.get("identifier", model_name)
 
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-
-    if model_type == "glm4v":
-        model = Glm4vForConditionalGeneration.from_pretrained(
-            pretrained_model_name_or_path=model_path,
-            dtype=dtype,
-            device_map="cuda:0" if torch.cuda.is_available() else "cpu",
+    cached = _LOADED_MODELS.get(model_name)
+    if cached and cached.get("location") == location:
+        return (
+            cached["model"],
+            cached["processor"],
+            cached["device"],
+            cached["model_type"],
         )
-        processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
-        return model, processor, device, "glm4v"
+
+    model_path = location
+    if not os.path.exists(model_path):
+        model_path = model_config.get("identifier", model_path)
+
+    tensor_parallel = max(torch.cuda.device_count(), 1)
+    gpu_memory_util = _resolve_vllm_gpu_utilization(model_config)
+    max_model_len = _resolve_vllm_max_model_len(model_config)
+    sampling_params = _resolve_sampling_params(model_type, model_config)
+
+    llm = LLM(
+        model=model_path,
+        trust_remote_code=True,
+        tensor_parallel_size=tensor_parallel,
+        gpu_memory_utilization=gpu_memory_util,
+        max_model_len=max_model_len,
+        seed=0,
+    )
 
     if model_type == "medgemma":
-        model_load_path = model_path
-        if not os.path.exists(model_load_path):
-            model_load_path = model_config.get("identifier", model_path)
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_load_path,
-            dtype=dtype,
-            device_map="cuda:0" if torch.cuda.is_available() else "cpu",
-            trust_remote_code=True,
-        )
         processor = MedGemmaProcessor.from_pretrained(
-            model_load_path, trust_remote_code=True
+            model_path, trust_remote_code=True
         )
-        return model, processor, device, "medgemma"
+    else:
+        try:
+            processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+        except TypeError:
+            processor = AutoProcessor.from_pretrained(model_path)
 
-    if model_type == "qwen3_vl":
-        model_load_path = model_path
-        if not os.path.exists(model_load_path):
-            model_load_path = model_config.get("identifier", model_path)
+    model_bundle = {"llm": llm, "sampling_params": sampling_params}
 
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_load_path,
-            dtype="auto",
-            device_map="auto",
-        )
-        processor = AutoProcessor.from_pretrained(model_load_path)
-        return model, processor, device, "qwen3_vl"
+    _LOADED_MODELS[model_name] = {
+        "model": model_bundle,
+        "processor": processor,
+        "device": device,
+        "model_type": model_type,
+        "location": location,
+    }
 
-    raise ValueError(f"暂不支持的模型类型：{model_type}")
+    return model_bundle, processor, device, model_type
+
+
+def get_loaded_model_state(
+    model_name: Optional[str] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """返回已缓存的模型状态，用于跨会话同步。"""
+    if model_name:
+        cached = _LOADED_MODELS.get(model_name)
+        if cached is None:
+            return None
+        return model_name, cached
+
+    if not _LOADED_MODELS:
+        return None
+
+    name, cached = next(iter(_LOADED_MODELS.items()))
+    return name, cached
 
 
 def parse_analysis_result(raw_text: str) -> tuple[str, str]:
@@ -502,44 +625,6 @@ def parse_analysis_result(raw_text: str) -> tuple[str, str]:
         answer_content = raw_text.strip()
 
     return think_content, answer_content
-
-
-def _stream_model_output(
-    model,
-    processor,
-    inputs,
-    *,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    stream_callback: Optional[Callable[[str], None]],
-) -> str:
-    """执行流式生成，并通过回调返回增量文本。"""
-    streamer = TextIteratorStreamer(
-        processor.tokenizer, skip_prompt=True, skip_special_tokens=False
-    )
-
-    model_inputs = dict(inputs)
-    generation_kwargs = {
-        **model_inputs,
-        "max_new_tokens": max_new_tokens,
-        "temperature": temperature,
-        "do_sample": True,
-        "top_p": top_p,
-        "streamer": streamer,
-    }
-
-    thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
-    thread.start()
-
-    collected_chunks: List[str] = []
-    for chunk in streamer:
-        if stream_callback:
-            stream_callback(chunk)
-        collected_chunks.append(chunk)
-
-    thread.join()
-    return "".join(collected_chunks).strip()
 
 
 def process_image_analysis(
@@ -564,64 +649,35 @@ def process_image_analysis(
         if cached:
             return cached
 
-    messages = [
+    start_time = time.time()
+
+    image_input = (
+        _encode_image_to_base64(image) if model_type == "qwen3_vl" else image
+    )
+    multimodal_messages = [
         {
             "role": "user",
             "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                },
+                {"type": "image", "image": image_input},
                 {"type": "text", "text": prompt},
             ],
         }
     ]
 
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
+    vllm_inputs = _prepare_inputs_for_vllm(multimodal_messages, processor)
+    model_bundle = model if isinstance(model, dict) else {"llm": model}
+    llm = model_bundle["llm"]
+    sampling_params = model_bundle.get("sampling_params") or _resolve_sampling_params(
+        model_type, {}
     )
 
-    if not hasattr(model, "hf_device_map"):
-        inputs = inputs.to(device)
+    outputs = llm.generate([vllm_inputs], sampling_params=sampling_params)
+    generated_text = outputs[0].outputs[0].text or ""
 
-    start_time = time.time()
+    if stream_callback and generated_text:
+        stream_callback(generated_text)
 
-    if model_type == "glm4v":
-        raw_text = _stream_model_output(
-            model,
-            processor,
-            inputs,
-            max_new_tokens=8192,
-            temperature=0.8,
-            top_p=0.9,
-            stream_callback=stream_callback,
-        )
-    elif model_type == "medgemma":
-        raw_text = _stream_model_output(
-            model,
-            processor,
-            inputs,
-            max_new_tokens=4096,
-            temperature=0.7,
-            top_p=0.9,
-            stream_callback=stream_callback,
-        )
-    elif model_type == "qwen3_vl":
-        raw_text = _stream_model_output(
-            model,
-            processor,
-            inputs,
-            max_new_tokens=1024,
-            temperature=0.7,
-            top_p=0.9,
-            stream_callback=stream_callback,
-        )
-    else:
-        raise ValueError(f"未知的模型类型：{model_type}")
+    raw_text = generated_text.strip()
 
     elapsed = time.time() - start_time
     think_content, answer_content = parse_analysis_result(raw_text)
@@ -714,6 +770,7 @@ __all__ = [
     "get_analysis_history",
     "get_cached_result",
     "get_device_info",
+    "get_loaded_model_state",
     "init_database",
     "load_model",
     "parse_analysis_result",

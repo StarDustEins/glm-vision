@@ -18,6 +18,7 @@ from app_logic import (
     fetch_cache_metrics,
     get_analysis_history,
     get_device_info,
+    get_loaded_model_state,
     init_database,
     load_model,
     process_image_analysis,
@@ -61,6 +62,26 @@ def _ensure_session_state(available_models: Dict[str, Dict[str, str]]) -> None:
     ):
         st.session_state.current_model = next(iter(available_models.keys()))
         st.session_state.model_loaded = False
+
+    if not st.session_state.model_loaded:
+        candidate = None
+        current_model_name = st.session_state.get("current_model")
+        if current_model_name:
+            candidate = get_loaded_model_state(current_model_name)
+        if candidate is None:
+            candidate = get_loaded_model_state()
+
+        if candidate:
+            loaded_name, cached = candidate
+            if loaded_name in available_models:
+                st.session_state.model = cached["model"]
+                st.session_state.processor = cached["processor"]
+                st.session_state.device = cached["device"]
+                st.session_state.model_type = cached["model_type"]
+                st.session_state.current_model = loaded_name
+                st.session_state.model_loaded = True
+                st.session_state.loading_model = False
+                st.session_state.pop("loading_target", None)
 
 
 def _register_analysis_result(
