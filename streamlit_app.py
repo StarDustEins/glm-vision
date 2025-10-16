@@ -41,7 +41,7 @@ def _ensure_session_state(available_models: Dict[str, Dict[str, str]]) -> None:
         "model": None,
         "processor": None,
         "device": None,
-        "model_type": "glm4v",
+        "model_type": "qwen3_vl",
         "analysis_results": [],
         "loading_model": False,
     }
@@ -298,6 +298,8 @@ def _render_sidebar() -> None:
 
         model_info = available_models[selected_model]
         st.caption(f"模型位置：{model_info.get('path')}")
+        if model_info.get("inference_mode") == "siliconflow":
+            st.caption("☁️ 推理由 SiliconFlow 云端算力提供，无需本地 GPU。")
 
         model_needs_reload = (
             not st.session_state.model_loaded

@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 import torch
 from PIL import Image
 from modelscope import AutoProcessor
@@ -43,7 +46,27 @@ DEFAULT_MEDICAL_PROMPT = """
 若信息不足，请说明“不足以判断”并提示需要的补充资料。
 """
 
+SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+SILICONFLOW_API_KEY = os.environ.get(
+    "SILICONFLOW_API_KEY",
+    "sk-khdvgcgwzbhwqhfcrlbaoazfegxfypunnlgpnwkhbydqqvth",
+)
+try:
+    SILICONFLOW_TIMEOUT = float(os.environ.get("SILICONFLOW_TIMEOUT", "60"))
+except ValueError:
+    SILICONFLOW_TIMEOUT = 60.0
+
+
+def _is_siliconflow_model(model: object) -> bool:
+    return isinstance(model, dict) and model.get("inference_mode") == "siliconflow"
+
 REMOTE_MODEL_TEMPLATES: Dict[str, Dict[str, str]] = {
+    "Qwen3-VL-8B": {
+        "identifier": "Qwen/Qwen3-VL-8B-Instruct",
+        "description": "Qwen3 VL 8B 视觉语言模型（SiliconFlow 云端）",
+        "model_type": "qwen3_vl",
+        "inference_mode": "siliconflow",
+    },
     "GLM-4V-9B": {
         "identifier": "ZhipuAI/GLM-4.1V-9B-Thinking",
         "description": "GLM-4V多模态大模型 (9B参数)",
@@ -53,11 +76,6 @@ REMOTE_MODEL_TEMPLATES: Dict[str, Dict[str, str]] = {
         "identifier": "google/medgemma-4b-it",
         "description": "MedGemma医学专用模型 (4B参数)",
         "model_type": "medgemma",
-    },
-    "Qwen3-VL-8B": {
-        "identifier": "Qwen/Qwen3-VL-8B-Instruct",
-        "description": "Qwen3 VL 8B 视觉语言模型",
-        "model_type": "qwen3_vl",
     },
 }
 
@@ -69,6 +87,83 @@ def _encode_image_to_base64(image: Image.Image) -> str:
     image.save(buffer, format="PNG")
     base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{base64_str}"
+
+
+def _call_siliconflow_chat_completion(
+    messages: List[Dict[str, object]],
+    *,
+    model_identifier: str,
+    base_url: Optional[str] = None,
+) -> str:
+    if not SILICONFLOW_API_KEY:
+        raise RuntimeError("未配置 SiliconFlow API Key，无法调用云端算力")
+
+    endpoint_base = (base_url or SILICONFLOW_BASE_URL).rstrip("/")
+    request_url = f"{endpoint_base}/chat/completions"
+    payload = {
+        "model": model_identifier,
+        "messages": messages,
+        "stream": False,
+    }
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    request = urllib_request.Request(request_url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib_request.urlopen(request, timeout=SILICONFLOW_TIMEOUT) as response:
+            raw_body = response.read()
+    except urllib_error.HTTPError as exc:
+        detail_bytes = exc.read() or b""
+        detail_message = exc.reason
+        if detail_bytes:
+            try:
+                detail_payload = json.loads(detail_bytes.decode("utf-8"))
+                if isinstance(detail_payload, dict):
+                    detail_message = detail_payload.get("error") or detail_payload
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                detail_message = detail_bytes.decode("utf-8", errors="ignore") or detail_message
+        raise RuntimeError(f"SiliconFlow API 请求失败：{detail_message}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"无法连接 SiliconFlow API：{exc}") from exc
+
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("SiliconFlow API 响应解析失败") from exc
+
+    error_info = body.get("error")
+    if error_info:
+        if isinstance(error_info, dict):
+            message = error_info.get("message") or json.dumps(error_info, ensure_ascii=False)
+        else:
+            message = str(error_info)
+        raise RuntimeError(f"SiliconFlow API 返回错误：{message}")
+
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError("SiliconFlow API 返回空响应")
+
+    message = choices[0].get("message", {})
+    content = message.get("content")
+    if isinstance(content, list):
+        segments: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                segment = item.get("text")
+                if segment:
+                    segments.append(str(segment))
+            elif isinstance(item, str):
+                segments.append(item)
+        content = "".join(segments)
+
+    if content is None:
+        content = ""
+
+    return str(content)
 
 
 def _resolve_vllm_gpu_utilization(config: Dict[str, Any]) -> float:
@@ -275,9 +370,13 @@ def build_available_models() -> Dict[str, Dict[str, str]]:
             config["source"] = "local"
             config["location"] = local_path
         else:
-            config["path"] = identifier
             config["source"] = "remote"
             config["location"] = identifier
+            if config.get("inference_mode") == "siliconflow":
+                config["path"] = "SiliconFlow Cloud"
+                config.setdefault("base_url", SILICONFLOW_BASE_URL)
+            else:
+                config["path"] = identifier
 
         if config.get("model_type") in SUPPORTED_MODEL_TYPES:
             models[name] = config
@@ -540,9 +639,40 @@ def clear_analysis_cache() -> None:
 
 def load_model(model_name: str, model_config: Dict[str, str]):
     """加载指定模型，返回 (model_bundle, processor, device, model_type)。"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_type = model_config.get("model_type", "glm4v")
-    location = model_config.get("path") or model_config.get("identifier", model_name)
+    identifier = model_config.get("identifier", model_name)
+    inference_mode = model_config.get("inference_mode")
+
+    if inference_mode == "siliconflow":
+        location = f"siliconflow::{identifier}"
+        cached = _LOADED_MODELS.get(model_name)
+        if cached and cached.get("location") == location:
+            return (
+                cached["model"],
+                cached["processor"],
+                cached["device"],
+                cached["model_type"],
+            )
+
+        base_url = model_config.get("base_url") or SILICONFLOW_BASE_URL
+        model_bundle = {
+            "inference_mode": "siliconflow",
+            "identifier": identifier,
+            "base_url": base_url,
+        }
+
+        _LOADED_MODELS[model_name] = {
+            "model": model_bundle,
+            "processor": None,
+            "device": "siliconflow",
+            "model_type": model_type,
+            "location": location,
+        }
+
+        return model_bundle, None, "siliconflow", model_type
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    location = model_config.get("path") or identifier
 
     cached = _LOADED_MODELS.get(model_name)
     if cached and cached.get("location") == location:
@@ -555,7 +685,7 @@ def load_model(model_name: str, model_config: Dict[str, str]):
 
     model_path = location
     if not os.path.exists(model_path):
-        model_path = model_config.get("identifier", model_path)
+        model_path = identifier
 
     tensor_parallel = max(torch.cuda.device_count(), 1)
     gpu_memory_util = _resolve_vllm_gpu_utilization(model_config)
@@ -631,7 +761,7 @@ def process_image_analysis(
     image: Image.Image,
     model,
     processor,
-    device: torch.device,
+    device: Any,
     model_type: str,
     model_name: str,
     *,
@@ -641,7 +771,8 @@ def process_image_analysis(
     stream_callback: Optional[Callable[[str], None]] = None,
 ) -> AnalysisResult:
     """执行图像分析，返回分析结果。"""
-    if model is None or processor is None:
+    remote_inference = _is_siliconflow_model(model)
+    if model is None or (processor is None and not remote_inference):
         raise ValueError("模型尚未加载")
 
     if enable_cache:
@@ -651,33 +782,59 @@ def process_image_analysis(
 
     start_time = time.time()
 
-    image_input = (
-        _encode_image_to_base64(image) if model_type == "qwen3_vl" else image
-    )
-    multimodal_messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image_input},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
+    if remote_inference:
+        image_payload = _encode_image_to_base64(image)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_payload, "detail": "high"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
 
-    vllm_inputs = _prepare_inputs_for_vllm(multimodal_messages, processor)
-    model_bundle = model if isinstance(model, dict) else {"llm": model}
-    llm = model_bundle["llm"]
-    sampling_params = model_bundle.get("sampling_params") or _resolve_sampling_params(
-        model_type, {}
-    )
+        model_identifier = model.get("identifier", model_name)
+        base_url = model.get("base_url")
+        raw_text = _call_siliconflow_chat_completion(
+            messages,
+            model_identifier=model_identifier,
+            base_url=base_url,
+        ).strip()
 
-    outputs = llm.generate([vllm_inputs], sampling_params=sampling_params)
-    generated_text = outputs[0].outputs[0].text or ""
+        if stream_callback and raw_text:
+            stream_callback(raw_text)
+    else:
+        image_input = (
+            _encode_image_to_base64(image) if model_type == "qwen3_vl" else image
+        )
+        multimodal_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image_input},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
 
-    if stream_callback and generated_text:
-        stream_callback(generated_text)
+        vllm_inputs = _prepare_inputs_for_vllm(multimodal_messages, processor)
+        model_bundle = model if isinstance(model, dict) else {"llm": model}
+        llm = model_bundle["llm"]
+        sampling_params = model_bundle.get("sampling_params") or _resolve_sampling_params(
+            model_type, {}
+        )
 
-    raw_text = generated_text.strip()
+        outputs = llm.generate([vllm_inputs], sampling_params=sampling_params)
+        generated_text = outputs[0].outputs[0].text or ""
+
+        if stream_callback and generated_text:
+            stream_callback(generated_text)
+
+        raw_text = generated_text.strip()
 
     elapsed = time.time() - start_time
     think_content, answer_content = parse_analysis_result(raw_text)
