@@ -1,6 +1,0 @@
----
-description:
-globs:
-alwaysApply: true
----
-记住在conda的transformers环境下运行该项目

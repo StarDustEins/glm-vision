@@ -1,0 +1,21 @@
+[project]
+name = "glm-vision"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "streamlit>=1.50.0",
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "modelscope>=1.9.0",
+    "pillow>=10.0.0",
+    "psutil>=5.9.0",
+    "pandas>=2.1.0",
+    "accelerate>=0.29.0",
+    "torchvision>=0.24.0",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
