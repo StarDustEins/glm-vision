@@ -37,13 +37,24 @@ _LOADED_MODELS: Dict[str, Dict[str, Any]] = {}
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 DEFAULT_MEDICAL_PROMPT = """
-你是资深影像科医生。结合所给医学图像，请直接输出以下三部分内容，保持语言精炼、专业、中文：
+你是资深影像科医生兼医学影像审核员，请用简体中文。
 
-1. **部位判断**：明确图像对应的解剖部位或器官。
-2. **检查所见**：概述主要影像表现，可包含异常与否、形态、密度/信号特点等。
-3. **诊断意见**：给出最可能诊断及必要的鉴别或进一步检查建议。
+<think>
+逐步说明你的推理：先判断图像是否医学影像（如X光、CT、MRI、超声、病理切片等），再分析主要征象、诊断逻辑、置信度依据，并记录任何不确定性或补充需求。
+</think>
 
-若信息不足，请说明“不足以判断”并提示需要的补充资料。
+若图像并非医学影像或信息不足，请在 <answer> 中仅返回：
+温馨提示：当前上传的图像似乎不是医学影像，请检查后重新上传。（可附一句原因或所需资料）
+
+若确认是医学影像，请在 <answer> 中按以下格式输出，保持语句简洁：
+1. 部位信息：…
+2. 检查所见：…
+3. 诊断意见：…
+4. 置信度：高/中/低（简述依据或补充需求）
+
+最终输出格式必须严格为：
+<think>你的思考过程</think>
+<answer>你的最终回答</answer>
 """
 
 SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
@@ -61,8 +72,14 @@ def _is_siliconflow_model(model: object) -> bool:
     return isinstance(model, dict) and model.get("inference_mode") == "siliconflow"
 
 REMOTE_MODEL_TEMPLATES: Dict[str, Dict[str, str]] = {
-    "Qwen3-VL-8B": {
+    "Qwen3-VL-8B-Instruct": {
         "identifier": "Qwen/Qwen3-VL-8B-Instruct",
+        "description": "Qwen3 VL 8B 视觉语言模型（SiliconFlow 云端）",
+        "model_type": "qwen3_vl",
+        "inference_mode": "siliconflow",
+    },
+    "Qwen3-VL-8B-Thinking": {
+        "identifier": "Qwen/Qwen3-VL-8B-Thinking",
         "description": "Qwen3 VL 8B 视觉语言模型（SiliconFlow 云端）",
         "model_type": "qwen3_vl",
         "inference_mode": "siliconflow",
@@ -89,12 +106,32 @@ def _encode_image_to_base64(image: Image.Image) -> str:
     return f"data:image/png;base64,{base64_str}"
 
 
+def _collect_message_text(payload: object) -> str:
+    """将SiliconFlow返回的消息片段统一拼接为字符串。"""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        if "text" in payload:
+            value = payload.get("text")
+            return value if isinstance(value, str) else _collect_message_text(value)
+        if "content" in payload:
+            return _collect_message_text(payload.get("content"))
+    if isinstance(payload, list):
+        parts: List[str] = []
+        for item in payload:
+            text = _collect_message_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
 def _call_siliconflow_chat_completion(
     messages: List[Dict[str, object]],
     *,
     model_identifier: str,
     base_url: Optional[str] = None,
-) -> str:
+) -> Tuple[str, str]:
     if not SILICONFLOW_API_KEY:
         raise RuntimeError("未配置 SiliconFlow API Key，无法调用云端算力")
 
@@ -148,22 +185,18 @@ def _call_siliconflow_chat_completion(
         raise RuntimeError("SiliconFlow API 返回空响应")
 
     message = choices[0].get("message", {})
-    content = message.get("content")
-    if isinstance(content, list):
-        segments: List[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                segment = item.get("text")
-                if segment:
-                    segments.append(str(segment))
-            elif isinstance(item, str):
-                segments.append(item)
-        content = "".join(segments)
+    content_text = _collect_message_text(message.get("content"))
+    reasoning_payload = (
+        message.get("reasoning_content")
+        or message.get("reasoning")
+        or message.get("thinking")
+    )
+    reasoning_text = _collect_message_text(reasoning_payload)
 
-    if content is None:
-        content = ""
+    if not isinstance(content_text, str):
+        raise RuntimeError("SiliconFlow API 返回的消息格式无法解析")
 
-    return str(content)
+    return content_text.strip(), reasoning_text.strip()
 
 
 def _resolve_vllm_gpu_utilization(config: Dict[str, Any]) -> float:
@@ -782,6 +815,9 @@ def process_image_analysis(
 
     start_time = time.time()
 
+    reasoning_text = ""
+    content_text = ""
+
     if remote_inference:
         image_payload = _encode_image_to_base64(image)
         messages = [
@@ -799,11 +835,21 @@ def process_image_analysis(
 
         model_identifier = model.get("identifier", model_name)
         base_url = model.get("base_url")
-        raw_text = _call_siliconflow_chat_completion(
+        content_text, reasoning_text = _call_siliconflow_chat_completion(
             messages,
             model_identifier=model_identifier,
             base_url=base_url,
-        ).strip()
+        )
+
+        raw_text = content_text.strip()
+        think_lower = "<think>" in raw_text.lower()
+        answer_lower = "<answer>" in raw_text.lower()
+        if reasoning_text and not think_lower:
+            composed_think = f"<think>{reasoning_text.strip()}</think>"
+            if answer_lower:
+                raw_text = f"{composed_think}\n{raw_text}"
+            else:
+                raw_text = f"{composed_think}\n<answer>{raw_text}</answer>"
 
         if stream_callback and raw_text:
             stream_callback(raw_text)
@@ -835,9 +881,16 @@ def process_image_analysis(
             stream_callback(generated_text)
 
         raw_text = generated_text.strip()
+        content_text = raw_text
 
     elapsed = time.time() - start_time
     think_content, answer_content = parse_analysis_result(raw_text)
+
+    if not think_content and reasoning_text:
+        think_content = reasoning_text.strip()
+    if not answer_content:
+        fallback = content_text.strip() if content_text else raw_text
+        answer_content = fallback
 
     if enable_cache and raw_text:
         created_at = save_analysis_result(
