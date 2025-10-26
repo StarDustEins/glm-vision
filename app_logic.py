@@ -43,21 +43,41 @@ DEFAULT_MEDICAL_PROMPT = """
 逐步说明你的推理：先判断图像是否医学影像（如X光、CT、MRI、超声、病理切片等），再分析主要征象、诊断逻辑、置信度依据，并记录任何不确定性或补充需求。
 </think>
 
-若图像并非医学影像或信息不足，请在 <answer> 中仅返回：
-温馨提示：当前上传的图像似乎不是医学影像，请检查后重新上传。（可附一句原因或所需资料）
+若图像并非医学影像或可见信息不足，请在 <answer> 中输出如下 JSON（仅此一段，不要添加额外文字）：
+{
+  "部位信息": "非医学影像",
+  "检查所见": "说明为何无法诊断或需要的补充信息",
+  "诊断意见": "温馨提示：当前上传的图像似乎不是医学影像，请检查后重新上传。",
+  "置信度": "低",
+  "makers": []
+}
 
-若确认是医学影像，请在 <answer> 中按以下格式输出，保持语句简洁：
-1. 部位信息：…
-2. 检查所见：…
-3. 诊断意见：…
-4. 置信度：高/中/低（简述依据或补充需求）
+若确认是医学影像，请在 <answer> 中输出一个 JSON 对象（仅此一段，不要添加额外文字），结构如下：
+{
+  "部位信息": "...",
+  "检查所见": "...",
+  "诊断意见": "...",
+  "置信度": "高/中/低",
+  "makers": [
+    {"x": 0.15, "y": 0.32, "width": 0.20, "height": 0.18},
+    ...
+  ]
+}
+
+要求：
+- JSON 所有键使用上面定义的中文名称。
+- 如果没有异常区域，makers 为 []。
+- makers 内的坐标均为 0~1 之间的小数，x/y 表示左上角相对于图像宽高的归一化坐标，width/height 表示对应框的归一化宽高。
+- 不要在 JSON 外输出任何其他字符（包括额外注释或段落）。
 
 最终输出格式必须严格为：
 <think>你的思考过程</think>
-<answer>你的最终回答</answer>
+<answer>上述 JSON 对象</answer>
 """
 
-SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+SILICONFLOW_BASE_URL = os.environ.get(
+    "SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"
+)
 SILICONFLOW_API_KEY = os.environ.get(
     "SILICONFLOW_API_KEY",
     "sk-khdvgcgwzbhwqhfcrlbaoazfegxfypunnlgpnwkhbydqqvth",
@@ -71,6 +91,7 @@ except ValueError:
 def _is_siliconflow_model(model: object) -> bool:
     return isinstance(model, dict) and model.get("inference_mode") == "siliconflow"
 
+
 REMOTE_MODEL_TEMPLATES: Dict[str, Dict[str, str]] = {
     "Qwen3-VL-8B-Instruct": {
         "identifier": "Qwen/Qwen3-VL-8B-Instruct",
@@ -81,6 +102,12 @@ REMOTE_MODEL_TEMPLATES: Dict[str, Dict[str, str]] = {
     "Qwen3-VL-8B-Thinking": {
         "identifier": "Qwen/Qwen3-VL-8B-Thinking",
         "description": "Qwen3 VL 8B 视觉语言模型（SiliconFlow 云端）",
+        "model_type": "qwen3_vl",
+        "inference_mode": "siliconflow",
+    },
+    "Qwen3-VL-32B-Thinking": {
+        "identifier": "Qwen/Qwen3-VL-32B-Thinking",
+        "description": "Qwen3 VL 32B 视觉语言模型（SiliconFlow 云端）",
         "model_type": "qwen3_vl",
         "inference_mode": "siliconflow",
     },
@@ -148,7 +175,9 @@ def _call_siliconflow_chat_completion(
         "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
         "Content-Type": "application/json",
     }
-    request = urllib_request.Request(request_url, data=data, headers=headers, method="POST")
+    request = urllib_request.Request(
+        request_url, data=data, headers=headers, method="POST"
+    )
 
     try:
         with urllib_request.urlopen(request, timeout=SILICONFLOW_TIMEOUT) as response:
@@ -162,7 +191,9 @@ def _call_siliconflow_chat_completion(
                 if isinstance(detail_payload, dict):
                     detail_message = detail_payload.get("error") or detail_payload
             except (UnicodeDecodeError, json.JSONDecodeError):
-                detail_message = detail_bytes.decode("utf-8", errors="ignore") or detail_message
+                detail_message = (
+                    detail_bytes.decode("utf-8", errors="ignore") or detail_message
+                )
         raise RuntimeError(f"SiliconFlow API 请求失败：{detail_message}") from exc
     except urllib_error.URLError as exc:
         raise RuntimeError(f"无法连接 SiliconFlow API：{exc}") from exc
@@ -175,7 +206,9 @@ def _call_siliconflow_chat_completion(
     error_info = body.get("error")
     if error_info:
         if isinstance(error_info, dict):
-            message = error_info.get("message") or json.dumps(error_info, ensure_ascii=False)
+            message = error_info.get("message") or json.dumps(
+                error_info, ensure_ascii=False
+            )
         else:
             message = str(error_info)
         raise RuntimeError(f"SiliconFlow API 返回错误：{message}")
@@ -260,7 +293,9 @@ def _resolve_sampling_params(model_type: str, config: Dict[str, Any]) -> Samplin
     )
 
 
-def _prepare_inputs_for_vllm(messages: List[Dict[str, object]], processor) -> Dict[str, object]:
+def _prepare_inputs_for_vllm(
+    messages: List[Dict[str, object]], processor
+) -> Dict[str, object]:
     prompt = processor.apply_chat_template(
         messages,
         tokenize=False,
@@ -644,9 +679,7 @@ def fetch_all_cache_records() -> List[Dict[str, object]]:
     conn = sqlite3.connect(DATABASE_PATH)
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM analysis_results ORDER BY created_at DESC"
-        )
+        cursor.execute("SELECT * FROM analysis_results ORDER BY created_at DESC")
         rows = cursor.fetchall()
         columns = [description[0] for description in cursor.description]
     except sqlite3.Error as exc:
@@ -870,9 +903,9 @@ def process_image_analysis(
         vllm_inputs = _prepare_inputs_for_vllm(multimodal_messages, processor)
         model_bundle = model if isinstance(model, dict) else {"llm": model}
         llm = model_bundle["llm"]
-        sampling_params = model_bundle.get("sampling_params") or _resolve_sampling_params(
-            model_type, {}
-        )
+        sampling_params = model_bundle.get(
+            "sampling_params"
+        ) or _resolve_sampling_params(model_type, {})
 
         outputs = llm.generate([vllm_inputs], sampling_params=sampling_params)
         generated_text = outputs[0].outputs[0].text or ""
@@ -924,7 +957,10 @@ def validate_image(uploaded_file) -> tuple[bool, str]:
 
     file_ext = os.path.splitext(uploaded_file.name)[1].lower()
     if file_ext not in SUPPORTED_FORMATS:
-        return False, f"不支持的格式 {file_ext}。支持的格式：{', '.join(SUPPORTED_FORMATS)}"
+        return (
+            False,
+            f"不支持的格式 {file_ext}。支持的格式：{', '.join(SUPPORTED_FORMATS)}",
+        )
 
     if uploaded_file.size > 10 * 1024 * 1024:
         return False, "文件大小超过10MB限制"
