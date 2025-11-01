@@ -93,30 +93,42 @@ def _is_siliconflow_model(model: object) -> bool:
 
 
 REMOTE_MODEL_TEMPLATES: Dict[str, Dict[str, str]] = {
-    "Qwen3-VL-8B-Instruct": {
+    "01": {
         "identifier": "Qwen/Qwen3-VL-8B-Instruct",
         "description": "Qwen3 VL 8B 视觉语言模型（SiliconFlow 云端）",
         "model_type": "qwen3_vl",
         "inference_mode": "siliconflow",
     },
-    "Qwen3-VL-8B-Thinking": {
+    "02": {
         "identifier": "Qwen/Qwen3-VL-8B-Thinking",
         "description": "Qwen3 VL 8B 视觉语言模型（SiliconFlow 云端）",
         "model_type": "qwen3_vl",
         "inference_mode": "siliconflow",
     },
-    "Qwen3-VL-32B-Thinking": {
-        "identifier": "Qwen/Qwen3-VL-32B-Thinking",
+    "03": {
+        "identifier": "Qwen/Qwen3-VL-32B-Instruct",
         "description": "Qwen3 VL 32B 视觉语言模型（SiliconFlow 云端）",
         "model_type": "qwen3_vl",
         "inference_mode": "siliconflow",
     },
-    "GLM-4V-9B": {
+    "04": {
+        "identifier": "Qwen/Qwen3-VL-235B-A22B-Instruct",
+        "description": "Qwen3 VL 235B 视觉语言模型（SiliconFlow 云端）",
+        "model_type": "qwen3_vl",
+        "inference_mode": "siliconflow",
+    },
+    "glmv": {
+        "identifier": "zai-org/GLM-4.5V",
+        "description": "zai-org/GLM-4.5V多模态大模型 (10B参数)",
+        "model_type": "glm4v",
+        "inference_mode": "siliconflow",
+    },
+    "GLM": {
         "identifier": "ZhipuAI/GLM-4.1V-9B-Thinking",
         "description": "GLM-4V多模态大模型 (9B参数)",
         "model_type": "glm4v",
     },
-    "MedGemma-4B": {
+    "MedGemma": {
         "identifier": "google/medgemma-4b-it",
         "description": "MedGemma医学专用模型 (4B参数)",
         "model_type": "medgemma",
@@ -158,17 +170,23 @@ def _call_siliconflow_chat_completion(
     *,
     model_identifier: str,
     base_url: Optional[str] = None,
+    extra_options: Optional[Dict[str, object]] = None,
 ) -> Tuple[str, str]:
     if not SILICONFLOW_API_KEY:
         raise RuntimeError("未配置 SiliconFlow API Key，无法调用云端算力")
 
     endpoint_base = (base_url or SILICONFLOW_BASE_URL).rstrip("/")
     request_url = f"{endpoint_base}/chat/completions"
-    payload = {
+    payload: Dict[str, object] = {
         "model": model_identifier,
         "messages": messages,
         "stream": False,
     }
+
+    if extra_options:
+        payload.update({
+            key: value for key, value in extra_options.items() if value is not None
+        })
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {

@@ -17,6 +17,7 @@ dependencies = [
     "vllm>=0.5.0",
     "qwen-vl-utils>=0.0.14",
     "watchdog>=6.0.0",
+    "moviepy>=2.2.1",
 ]
 
 [[tool.uv.index]]

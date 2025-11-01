@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
-from typing import Any, Dict, Tuple
+import json
+from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from app_logic import (
     DEFAULT_MEDICAL_PROMPT,
@@ -59,6 +60,127 @@ def _format_cache_metrics() -> str:
     lines.append(f"- 最近7天分析：{recent}")
     lines.append(f"- 数据库大小：{db_size:.2f} MB")
     return "\n".join(lines)
+
+
+def _extract_structured_answer(
+    answer_text: str,
+) -> Tuple[str, List[Dict[str, float]]]:
+    """将模型返回的 JSON 答案转换为 Markdown，同时提取标注框。"""
+    cleaned = (answer_text or "").strip()
+    if not cleaned:
+        return "", []
+
+    json_payload: Optional[Dict[str, Any]] = None
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        try:
+            json_payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            json_payload = None
+    else:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = cleaned[start : end + 1]
+            try:
+                json_payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                json_payload = None
+
+    if not isinstance(json_payload, dict):
+        return cleaned, []
+
+    markers_field = json_payload.get("makers")
+    if markers_field is None:
+        markers_field = json_payload.get("markers")
+    if markers_field is None:
+        markers_field = []
+    markers: List[Dict[str, float]] = []
+    if isinstance(markers_field, list):
+        for item in markers_field:
+            if not isinstance(item, dict):
+                continue
+            try:
+                height_value = item.get("height", item.get("hight"))
+                marker = {
+                    "x": float(item["x"]),
+                    "y": float(item["y"]),
+                    "width": float(item["width"]),
+                    "height": float(height_value),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            markers.append(marker)
+
+    section_map = {
+        "部位信息": json_payload.get("部位信息", ""),
+        "检查所见": json_payload.get("检查所见", ""),
+        "诊断意见": json_payload.get("诊断意见", ""),
+        "置信度": json_payload.get("置信度", ""),
+    }
+
+    lines = [
+        f"1. **部位信息**：{section_map['部位信息']}",
+        f"2. **检查所见**：{section_map['检查所见']}",
+        f"3. **诊断意见**：{section_map['诊断意见']}",
+        f"4. **置信度**：{section_map['置信度']}",
+    ]
+
+    if markers:
+        lines.append(
+            "5. **makers**："
+            + ", ".join(
+                f"(x={m['x']:.3f}, y={m['y']:.3f}, w={m['width']:.3f}, h={m['height']:.3f})"
+                for m in markers
+            )
+        )
+    else:
+        lines.append("5. **makers**：[]")
+
+    return "\n".join(lines), markers
+
+
+def _build_slider_images(
+    base_image: Optional[Image.Image],
+    markers: List[Dict[str, float]],
+) -> Optional[Tuple[Image.Image, Image.Image]]:
+    """构建原图与标注图对，供 ImageSlider 使用。"""
+    if base_image is None:
+        return None
+
+    original = base_image.copy()
+    annotated = base_image.copy()
+
+    if not markers:
+        return (original, annotated)
+
+    draw = ImageDraw.Draw(annotated)
+    width, height = annotated.size
+    has_box = False
+
+    for marker in markers:
+        try:
+            x = float(marker["x"])
+            y = float(marker["y"])
+            w = float(marker["width"])
+            h = float(marker["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        x0 = max(0.0, min(1.0, x)) * width
+        y0 = max(0.0, min(1.0, y)) * height
+        x1 = max(0.0, min(1.0, x + w)) * width
+        y1 = max(0.0, min(1.0, y + h)) * height
+
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        draw.rectangle([x0, y0, x1, y1], outline="#ff4d4f", width=4)
+        has_box = True
+
+    if not has_box:
+        return (original, original.copy())
+
+    return (original, annotated)
 
 
 def _build_history_dataframe(limit: int = 20) -> pd.DataFrame:
@@ -134,11 +256,22 @@ def _run_analysis(
     enable_cache: bool,
     state: Dict[str, Any],
     available_models: Dict[str, Dict[str, str]],
-) -> Tuple[Dict[str, Any], str, str, str, pd.DataFrame, str]:
+) -> Tuple[
+    Dict[str, Any],
+    str,
+    str,
+    str,
+    pd.DataFrame,
+    str,
+    Optional[Tuple[Image.Image, Image.Image]],
+]:
     state = dict(state or {})
 
     def _final(
-        status_html: str, answer: str = "", think: str = ""
+        status_html: str,
+        answer: str = "",
+        think: str = "",
+        slider_images: Optional[Tuple[Image.Image, Image.Image]] = None,
     ) -> Tuple[
         Dict[str, Any],
         str,
@@ -146,6 +279,7 @@ def _run_analysis(
         str,
         pd.DataFrame,
         str,
+        Optional[Tuple[Image.Image, Image.Image]],
     ]:
         return (
             state,
@@ -154,6 +288,7 @@ def _run_analysis(
             think,
             _build_history_dataframe(),
             _format_cache_metrics(),
+            slider_images,
         )
 
     if not available_models:
@@ -188,6 +323,9 @@ def _run_analysis(
 
     prompt_text = DEFAULT_MEDICAL_PROMPT.strip()
 
+    display_image: Optional[Image.Image] = None
+    processing_image: Optional[Image.Image] = None
+
     try:
         file_size = os.path.getsize(image_path)
         filename = os.path.basename(image_path)
@@ -198,7 +336,8 @@ def _run_analysis(
                 _compose_status(f"⚠️ {message}", level="warning"),
             )
         with Image.open(image_path) as img:
-            image = img.convert("RGB")
+            display_image = img.convert("RGB")
+        processing_image = display_image.copy()
     except Exception as exc:  # noqa: BLE001
         return _final(
             _compose_status(f"❌ 图像读取失败：{exc}", level="error"),
@@ -206,7 +345,7 @@ def _run_analysis(
 
     try:
         result = process_image_analysis(
-            image=image,
+            image=processing_image,
             model=state["model"],
             processor=state.get("processor"),
             device=state.get("device"),
@@ -222,13 +361,15 @@ def _run_analysis(
         )
 
     status = _render_status(result)
-    answer = result.answer_content or result.raw_result
+    raw_answer = result.answer_content or result.raw_result
+    formatted_answer, markers = _extract_structured_answer(raw_answer)
+    slider_images = _build_slider_images(display_image, markers)
     think = result.think_content or "（模型未返回显性推理过程）"
 
     history_df = _build_history_dataframe()
     cache_stats = _format_cache_metrics()
 
-    return state, status, answer, think, history_df, cache_stats
+    return state, status, formatted_answer, think, history_df, cache_stats, slider_images
 
 
 def _render_status(result: AnalysisResult) -> str:
@@ -266,27 +407,56 @@ def main() -> gr.Blocks:
         image_path: str,
         use_cache: bool,
         state: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], str, str, str, pd.DataFrame, str]:
-        return _run_analysis(
+    ) -> Tuple[
+        Dict[str, Any],
+        str,
+        str,
+        str,
+        pd.DataFrame,
+        str,
+        Optional[Tuple[Image.Image, Image.Image]],
+    ]:
+        (
+            next_state,
+            status_html,
+            answer_md,
+            think_md,
+            history_df,
+            cache_stats,
+            slider_images,
+        ) = _run_analysis(
             selected_model,
             image_path,
             use_cache,
             state,
             available_models,
         )
+        slider_update = (
+            gr.update(value=slider_images) if slider_images is not None else gr.update(value=None)
+        )
+        return (
+            next_state,
+            status_html,
+            answer_md,
+            think_md,
+            history_df,
+            cache_stats,
+            slider_update,
+        )
 
-    def _on_analysis_start() -> Tuple[gr.Button, gr.HTML]:
+    def _on_analysis_start() -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """推理开始时禁用按钮并提示加载状态。"""
         return (
-            gr.Button.update(interactive=False),
+            gr.update(interactive=False, value="分析中..."),
             gr.update(
                 value=_compose_status("⏳ 正在分析图像，请稍候...", level="info")
             ),
+            gr.update(value=None),
         )
 
-    def _on_analysis_end() -> gr.Button:
+    def _on_analysis_end() -> Dict[str, Any]:
         """推理结束后恢复按钮可用状态。"""
-        return gr.Button.update(interactive=True)
+        return gr.update(interactive=True, value="开始分析")
 
     with gr.Blocks(
         title="医学图像AI诊断系统",
@@ -301,12 +471,10 @@ def main() -> gr.Blocks:
             with gr.Tab("业务"):
                 with gr.Row(equal_height=True):
                     with gr.Column(scale=2, elem_id="inference-panel"):
-                        # gr.Markdown("### 上传与结果")
-                        image_input = gr.Image(
-                            label="医学影像",
-                            type="filepath",
-                            sources=["upload"],
-                            image_mode="RGB",
+                        image_slider = gr.ImageSlider(
+                            label="原始图像 / 标注对比",
+                            value=None,
+                            interactive=False,
                             height=420,
                             elem_id="preview-image",
                         )
@@ -327,6 +495,12 @@ def main() -> gr.Blocks:
                             interactive=bool(available_models),
                         )
 
+                        image_input = gr.File(
+                            label="上传医学影像文件",
+                            file_types=["image"],
+                            file_count="single",
+                            type="filepath",
+                        )
 
                         cache_checkbox = gr.Checkbox(label="启用缓存", value=True)
                         analyze_button = gr.Button("开始分析", variant="primary")
@@ -353,7 +527,7 @@ def main() -> gr.Blocks:
         analyze_button.click(
             fn=_on_analysis_start,
             inputs=None,
-            outputs=[analyze_button, status_display],
+            outputs=[analyze_button, status_display, image_slider],
             queue=False,
         ).then(
             fn=_handle_analysis,
@@ -365,6 +539,7 @@ def main() -> gr.Blocks:
                 think_md,
                 history_table,
                 cache_md,
+                image_slider,
             ],
         ).then(
             fn=_on_analysis_end,
